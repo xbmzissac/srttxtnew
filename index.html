@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>SRT批量处理工具 - OpenAI版本</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body {
+            max-width: 1000px;
+            margin: 20px auto;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+        }
+        .upload-box {
+            border: 2px dashed #ccc;
+            padding: 30px;
+            text-align: center;
+            margin: 20px 0;
+            cursor: pointer;
+            transition: border-color 0.3s;
+        }
+        .upload-box:hover {
+            border-color: #2196F3;
+        }
+        .file-list {
+            margin: 20px 0;
+            border: 1px solid #ddd;
+            padding: 15px;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        .file-item {
+            display: flex;
+            align-items: center;
+            margin: 10px 0;
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+            font-size: 0.9em;
+        }
+        .progress-container {
+            flex: 1;
+            margin: 0 15px;
+        }
+        .progress-bar {
+            height: 15px;
+            background: #f0f0f0;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background: #4CAF50;
+            transition: width 0.5s ease;
+        }
+        button {
+            background: #2196F3;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            margin: 5px;
+            transition: opacity 0.3s;
+        }
+        button:disabled {
+            background: #9E9E9E;
+            cursor: not-allowed;
+        }
+        #downloadAll {
+            background: #4CAF50;
+        }
+        .status-box {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            position: sticky;
+            bottom: 10px;
+        }
+        #globalProgress {
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        #globalProgressFill {
+            height: 100%;
+            background: #2196F3;
+            transition: width 0.5s ease;
+        }
+        .config-section {
+            margin: 20px 0;
+            padding: 15px;
+            background: #f5f5f5;
+            border-radius: 6px;
+        }
+        .config-row {
+            display: flex;
+            align-items: center;
+            margin: 10px 0;
+        }
+        .config-row label {
+            width: 120px;
+            font-weight: bold;
+        }
+        .config-row input, .config-row select {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h1>SRT批量处理工具 - OpenAI版本</h1>
+    
+    <div class="config-section">
+        <h3>配置设置</h3>
+        <div class="config-row">
+            <label for="apiKey">API密钥:</label>
+            <input type="password" id="apiKey" placeholder="请输入OpenAI API密钥" value="sk-your-openai-api-key">
+        </div>
+        <div class="config-row">
+            <label for="modelSelect">模型:</label>
+            <select id="modelSelect">
+                <option value="gpt-4">GPT-4</option>
+                <option value="gpt-4-turbo">GPT-4 Turbo</option>
+                <option value="gpt-3.5-turbo" selected>GPT-3.5 Turbo</option>
+                <option value="gpt-4o">GPT-4o</option>
+                <option value="gpt-4o-mini">GPT-4o Mini</option>
+            </select>
+        </div>
+        <div class="config-row">
+            <label for="baseUrl">API地址:</label>
+            <input type="text" id="baseUrl" placeholder="https://api.openai.com/v1" value="https://api.openai.com/v1">
+        </div>
+    </div>
+    
+    <div class="upload-box" onclick="document.getElementById('fileInput').click()">
+        <input type="file" id="fileInput" accept=".srt" multiple hidden>
+        <p>点击选择或拖放多个SRT文件</p>
+    </div>
+
+    <div class="file-list" id="fileList"></div>
+    
+    <div class="status-box">
+        <div id="globalProgress">
+            <div id="globalProgressFill" style="width: 0%"></div>
+        </div>
+        <div id="globalStatus"></div>
+        <button id="downloadAll" onclick="downloadAll()">打包下载全部结果</button>
+        <button id="cancelBtn" onclick="cancelProcessing()" style="display:none;background:#f44336">取消处理</button>
+    </div>
+
+    <script>
+        // =============== 配置参数 ================
+        const MAX_FILES = 200;                   // 最大文件数量
+        const MAX_FILE_SIZE = 2 * 1024 * 1024;   // 单个文件最大2MB
+        const MAX_CONCURRENT = 3;                // 并发处理数（OpenAI限制更严格）
+        const REQUEST_INTERVAL = 1500;           // API请求间隔(毫秒)
+        
+        // =============== 状态变量 ================
+        let processingQueue = new Map();
+        let completedFiles = new Map();
+        let isProcessing = false;
+        let abortController = new AbortController();
+
+        // ============== 文件处理逻辑 ==============
+        document.getElementById('fileInput').addEventListener('change', async (e) => {
+            if (isProcessing) {
+                alert('当前正在处理中，请稍后再试');
+                return;
+            }
+            
+            const files = Array.from(e.target.files);
+            if (files.length === 0) return;
+
+            if (files.length > MAX_FILES) {
+                alert(`单次最多处理${MAX_FILES}个文件`);
+                return;
+            }
+
+            // 检查API密钥
+            const apiKey = document.getElementById('apiKey').value.trim();
+            if (!apiKey) {
+                alert('请先输入OpenAI API密钥');
+                return;
+            }
+
+            initializeProcessing(files);
+            try {
+                await processFilesInBatches(files);
+            } catch (error) {
+                if (error.name !== 'AbortError') {
+                    updateGlobalStatus(`处理出错: ${error.message}`, 'error');
+                }
+            } finally {
+                finalizeProcessing();
+            }
+        });
+
+        async function processFilesInBatches(files) {
+            isProcessing = true;
+            document.getElementById('cancelBtn').style.display = 'inline-block';
+            
+            const totalFiles = files.length;
+            let processedCount = 0;
+            let batchNumber = 0;
+            
+            // 分批次处理
+            for (let i = 0; i < files.length; i += MAX_CONCURRENT) {
+                if (abortController.signal.aborted) break;
+                
+                const batch = files.slice(i, i + MAX_CONCURRENT);
+                batchNumber++;
+                
+                await processBatch(batch, batchNumber, totalFiles, (count) => {
+                    processedCount += count;
+                    updateGlobalProgress(processedCount, totalFiles);
+                });
+            }
+        }
+
+        async function processBatch(batch, batchNumber, totalFiles, progressCallback) {
+            return Promise.all(batch.map(async (file, indexInBatch) => {
+                if (abortController.signal.aborted) return;
+                
+                try {
+                    // 文件验证
+                    if (file.size > MAX_FILE_SIZE) {
+                        throw new Error('文件超过2MB限制');
+                    }
+
+                    updateFileStatus(file.name, 'processing');
+                    
+                    // 读取和清理内容
+                    const content = await readFile(file);
+                    const cleaned = cleanSRT(content);
+                    
+                    // API请求间隔控制
+                    await new Promise(resolve => setTimeout(resolve, indexInBatch * REQUEST_INTERVAL));
+                    
+                    // API调用
+                    const processed = await callOpenAI(cleaned, abortController.signal);
+                    
+                    // 保存结果
+                    completedFiles.set(file.name, processed);
+                    updateFileStatus(file.name, 'completed');
+                    progressCallback(1);
+                    
+                } catch (error) {
+                    const errorMsg = error.name === 'AbortError' ? '用户取消' : error.message;
+                    updateFileStatus(file.name, 'error', errorMsg);
+                }
+            }));
+        }
+
+        // ============== 核心功能函数 ==============
+        function readFile(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error('文件读取失败'));
+                reader.readAsText(file);
+            });
+        }
+
+        function cleanSRT(content) {
+            return content
+                .replace(/\d+\n\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}\n/g, '')
+                .replace(/^\d+$\n?/gm, '');
+        }
+
+        async function callOpenAI(text, signal) {
+            const apiKey = document.getElementById('apiKey').value.trim();
+            const model = document.getElementById('modelSelect').value;
+            const baseUrl = document.getElementById('baseUrl').value.trim() || 'https://api.openai.com/v1';
+            
+            const response = await fetch(`${baseUrl}/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`
+                },
+                body: JSON.stringify({
+                    model: model,
+                    messages: [{
+                        role: "system",
+                        content: "你是一个专业的文本分段助手。请严格按照用户的要求处理文本，不要添加任何额外的说明或解释。"
+                    }, {
+                        role: "user",
+                        content: `请严格按照以下规则处理文本：
+1. 按对话轮换划分段落，不同说话者独立成段
+2. 同一说话者的连续短句合并为一段，用标点连接
+3. 语义场景转换时用空行分隔
+4. 保留原始文本内容，不添加额外说明
+5. 去除时间戳和序号，只保留对话内容
+
+处理文本：
+${text}`
+                    }],
+                    temperature: 0.1,
+                    max_tokens: 4000
+                }),
+                signal: signal
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(`API错误: ${response.status} - ${errorData.error?.message || '未知错误'}`);
+            }
+            
+            const data = await response.json();
+            return data.choices[0].message.content;
+        }
+
+        // ============== 压缩下载功能 ==============
+        async function downloadAll() {
+            if (completedFiles.size === 0) return;
+
+            const zip = new JSZip();
+            const folder = zip.folder("processed_files");
+            let addedFiles = 0;
+
+            completedFiles.forEach((content, filename) => {
+                const newName = filename.replace(/\.srt$/i, '') + '.txt';
+                folder.file(newName, content);
+                addedFiles++;
+            });
+
+            try {
+                updateGlobalStatus('正在生成压缩包...', 'processing');
+                const content = await zip.generateAsync({ 
+                    type: "blob",
+                    compression: "DEFLATE",
+                    compressionOptions: { level: 6 }
+                }, metadata => {
+                    updateGlobalStatus(
+                        `压缩进度: ${metadata.percent.toFixed(1)}%`,
+                        'processing'
+                    );
+                });
+
+                triggerDownload(content);
+                updateGlobalStatus('下载已开始，请查看浏览器下载列表', 'success');
+            } catch (error) {
+                updateGlobalStatus(`压缩失败: ${error.message}`, 'error');
+            }
+        }
+
+        function triggerDownload(content) {
+            const url = URL.createObjectURL(content);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `srt_results_${Date.now()}.zip`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        // ============== UI控制函数 ==============
+        function initializeProcessing(files) {
+            resetUI();
+            abortController = new AbortController();
+            initializeFileList(files);
+            updateGlobalStatus('准备开始处理...', 'processing');
+            document.getElementById('fileInput').disabled = true;
+        }
+
+        function finalizeProcessing() {
+            isProcessing = false;
+            document.getElementById('cancelBtn').style.display = 'none';
+            document.getElementById('fileInput').disabled = false;
+            toggleDownloadButton();
+            if (!abortController.signal.aborted) {
+                updateGlobalStatus('处理完成！', 'success');
+            }
+        }
+
+        function cancelProcessing() {
+            abortController.abort();
+            updateGlobalStatus('处理已取消', 'error');
+            finalizeProcessing();
+        }
+
+        function initializeFileList(files) {
+            const listHTML = files.map(file => `
+                <div class="file-item" id="file-${file.name}">
+                    <span style="flex: 0 0 200px">${file.name}</span>
+                    <div class="progress-container">
+                        <div class="progress-bar">
+                            <div class="progress-fill"></div>
+                        </div>
+                    </div>
+                    <span class="status" style="width: 150px; text-align: right"></span>
+                </div>
+            `).join('');
+            document.getElementById('fileList').innerHTML = listHTML;
+        }
+
+        function updateFileStatus(filename, status, message = '') {
+            const item = document.getElementById(`file-${filename}`);
+            if (!item) return;
+
+            const progressFill = item.querySelector('.progress-fill');
+            const statusSpan = item.querySelector('.status');
+
+            progressFill.style.backgroundColor = '#4CAF50';
+            statusSpan.style.color = '#000';
+
+            switch(status) {
+                case 'processing':
+                    progressFill.style.width = '50%';
+                    statusSpan.textContent = '处理中...';
+                    statusSpan.style.color = '#2196F3';
+                    break;
+                case 'completed':
+                    progressFill.style.width = '100%';
+                    statusSpan.textContent = '✓ 完成';
+                    statusSpan.style.color = '#4CAF50';
+                    break;
+                case 'error':
+                    progressFill.style.width = '100%';
+                    progressFill.style.backgroundColor = '#f44336';
+                    statusSpan.textContent = `✗ ${message}`;
+                    statusSpan.style.color = '#f44336';
+                    break;
+            }
+        }
+
+        function updateGlobalProgress(current, total) {
+            const percent = (current / total) * 100;
+            document.getElementById('globalProgressFill').style.width = `${percent}%`;
+            updateGlobalStatus(`已处理 ${current}/${total} 个文件 (${percent.toFixed(1)}%)`, 'processing');
+        }
+
+        function updateGlobalStatus(message, type) {
+            const statusElement = document.getElementById('globalStatus');
+            statusElement.textContent = message;
+            statusElement.style.color = {
+                'processing': '#2196F3',
+                'success': '#4CAF50',
+                'error': '#f44336'
+            }[type] || '#000';
+        }
+
+        function toggleDownloadButton() {
+            document.getElementById('downloadAll').style.display = 
+                completedFiles.size > 0 ? 'inline-block' : 'none';
+        }
+
+        function resetUI() {
+            processingQueue.clear();
+            completedFiles.clear();
+            document.getElementById('fileList').innerHTML = '';
+            document.getElementById('globalProgressFill').style.width = '0%';
+            document.getElementById('downloadAll').style.display = 'none';
+            updateGlobalStatus('', '');
+        }
+
+        // ============== 拖放支持 ==============
+        document.addEventListener('dragover', e => e.preventDefault());
+        document.addEventListener('drop', e => {
+            e.preventDefault();
+            if (isProcessing) return;
+            
+            const files = Array.from(e.dataTransfer.files)
+                .filter(f => f.name.endsWith('.srt'));
+            
+            if (files.length > 0) {
+                document.getElementById('fileInput').files = e.dataTransfer.files;
+                document.getElementById('fileInput').dispatchEvent(new Event('change'));
+            }
+        });
+
+        // ============== 本地存储配置 ==============
+        // 页面加载时恢复配置
+        window.addEventListener('load', () => {
+            const savedApiKey = localStorage.getItem('openai_api_key');
+            const savedModel = localStorage.getItem('openai_model');
+            const savedBaseUrl = localStorage.getItem('openai_base_url');
+            
+            if (savedApiKey) document.getElementById('apiKey').value = savedApiKey;
+            if (savedModel) document.getElementById('modelSelect').value = savedModel;
+            if (savedBaseUrl) document.getElementById('baseUrl').value = savedBaseUrl;
+        });
+
+        // 配置变化时保存
+        document.getElementById('apiKey').addEventListener('change', (e) => {
+            localStorage.setItem('openai_api_key', e.target.value);
+        });
+
+        document.getElementById('modelSelect').addEventListener('change', (e) => {
+            localStorage.setItem('openai_model', e.target.value);
+        });
+
+        document.getElementById('baseUrl').addEventListener('change', (e) => {
+            localStorage.setItem('openai_base_url', e.target.value);
+        });
+    </script>
+</body>
+</html>
