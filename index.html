@@ -270,32 +270,6 @@
             });
         }
 
-        function cleanSRT(content) {
-            // 解析SRT格式，保留编号信息
-            const entries = [];
-            const blocks = content.split(/\n\s*\n/);
-            
-            blocks.forEach(block => {
-                const lines = block.trim().split('\n');
-                if (lines.length >= 3) {
-                    const number = lines[0].trim();
-                    const timestamp = lines[1].trim();
-                    const text = lines.slice(2).join('\n').trim();
-                    
-                    if (number && timestamp && text && /^\d+$/.test(number)) {
-                        entries.push({
-                            number: parseInt(number),
-                            timestamp: timestamp,
-                            text: text
-                        });
-                    }
-                }
-            });
-            
-            // 返回纯文本内容用于处理
-            return entries.map(entry => entry.text).join('\n');
-        }
-        
         function parseSRTWithNumbers(content) {
             // 解析SRT格式，返回带编号的条目
             const entries = [];
@@ -318,6 +292,9 @@
                 }
             });
             
+            return entries;
+        }
+        
         function processResult(aiResult, originalEntries) {
             // 解析AI返回的结果，提取编号信息
             const lines = aiResult.split('\n');
