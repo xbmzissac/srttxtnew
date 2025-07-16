@@ -162,6 +162,7 @@
         // =============== 状态变量 ================
         let processingQueue = new Map();
         let completedFiles = new Map();
+        let numberingFiles = new Map(); // 存储编号信息文件
         let isProcessing = false;
         let abortController = new AbortController();
 
@@ -233,18 +234,22 @@
 
                     updateFileStatus(file.name, 'processing');
                     
-                    // 读取和清理内容
+                    // 读取和解析SRT内容
                     const content = await readFile(file);
-                    const cleaned = cleanSRT(content);
+                    const srtEntries = parseSRTWithNumbers(content);
                     
                     // API请求间隔控制
                     await new Promise(resolve => setTimeout(resolve, indexInBatch * REQUEST_INTERVAL));
                     
                     // API调用
-                    const processed = await callOpenAI(cleaned, abortController.signal);
+                    const processed = await callOpenAI(srtEntries, abortController.signal);
+                    
+                    // 处理结果和生成编号文件
+                    const { cleanText, numberingInfo } = processResult(processed, srtEntries);
                     
                     // 保存结果
-                    completedFiles.set(file.name, processed);
+                    completedFiles.set(file.name, cleanText);
+                    numberingFiles.set(file.name, numberingInfo);
                     updateFileStatus(file.name, 'completed');
                     progressCallback(1);
                     
@@ -266,15 +271,116 @@
         }
 
         function cleanSRT(content) {
-            return content
-                .replace(/\d+\n\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}\n/g, '')
-                .replace(/^\d+$\n?/gm, '');
+            // 解析SRT格式，保留编号信息
+            const entries = [];
+            const blocks = content.split(/\n\s*\n/);
+            
+            blocks.forEach(block => {
+                const lines = block.trim().split('\n');
+                if (lines.length >= 3) {
+                    const number = lines[0].trim();
+                    const timestamp = lines[1].trim();
+                    const text = lines.slice(2).join('\n').trim();
+                    
+                    if (number && timestamp && text && /^\d+$/.test(number)) {
+                        entries.push({
+                            number: parseInt(number),
+                            timestamp: timestamp,
+                            text: text
+                        });
+                    }
+                }
+            });
+            
+            // 返回纯文本内容用于处理
+            return entries.map(entry => entry.text).join('\n');
+        }
+        
+        function parseSRTWithNumbers(content) {
+            // 解析SRT格式，返回带编号的条目
+            const entries = [];
+            const blocks = content.split(/\n\s*\n/);
+            
+            blocks.forEach(block => {
+                const lines = block.trim().split('\n');
+                if (lines.length >= 3) {
+                    const number = lines[0].trim();
+                    const timestamp = lines[1].trim();
+                    const text = lines.slice(2).join('\n').trim();
+                    
+                    if (number && timestamp && text && /^\d+$/.test(number)) {
+                        entries.push({
+                            number: parseInt(number),
+                            timestamp: timestamp,
+                            text: text
+                        });
+                    }
+                }
+            });
+            
+        function processResult(aiResult, originalEntries) {
+            // 解析AI返回的结果，提取编号信息
+            const lines = aiResult.split('\n');
+            const processedSentences = [];
+            const numberingInfo = [];
+            let sentenceCounter = 1;
+            
+            lines.forEach(line => {
+                line = line.trim();
+                if (!line) return;
+                
+                // 匹配格式：[编号1,编号2,编号3] 文本内容
+                const match = line.match(/^\[([^\]]+)\]\s*(.+)$/);
+                if (match) {
+                    const numbersStr = match[1];
+                    const text = match[2];
+                    
+                    // 解析编号
+                    const numbers = numbersStr.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n));
+                    
+                    if (numbers.length > 0 && text) {
+                        // 生成大编号（A, B, C...）
+                        const bigNumber = String.fromCharCode(64 + sentenceCounter); // A=65, B=66...
+                        
+                        // 记录编号信息
+                        numberingInfo.push({
+                            bigNumber: bigNumber,
+                            sentenceNumber: sentenceCounter,
+                            text: text,
+                            originalNumbers: numbers,
+                            description: `这一整句话是文件中的第${sentenceCounter}句话，大编号为${bigNumber}，组成部分为${numbers.join('，')}`
+                        });
+                        
+                        processedSentences.push(text);
+                        sentenceCounter++;
+                    }
+                } else if (line.length > 0) {
+                    // 没有编号标记的行，直接添加
+                    processedSentences.push(line);
+                }
+            });
+            
+            // 生成清理后的文本
+            const cleanText = processedSentences.join('\n');
+            
+            // 生成编号信息文本
+            const numberingInfoText = numberingInfo.map(info => {
+                return `${info.bigNumber}. ${info.text}\n   ${info.description}`;
+            }).join('\n\n');
+            
+            return {
+                cleanText: cleanText,
+                numberingInfo: numberingInfoText
+            };
         }
 
-        async function callOpenAI(text, signal) {
+        async function callOpenAI(srtEntries, signal) {
             const apiKey = document.getElementById('apiKey').value.trim();
             const model = document.getElementById('modelSelect').value;
             const baseUrl = document.getElementById('baseUrl').value.trim() || 'https://api.openai.com/v1';
+            
+            // 构建带编号的文本
+            const numberedText = srtEntries.map(entry => `[${entry.number}] ${entry.text}`).join('\n');
             
             const response = await fetch(`${baseUrl}/chat/completions`, {
                 method: 'POST',
@@ -286,7 +392,7 @@
                     model: model,
                     messages: [{
                         role: "system",
-                        content: "你是一个专业的文本分段助手。请严格按照用户的要求处理文本，不要添加任何额外的说明或解释。"
+                        content: "你是一个专业的文本分段助手。请严格按照用户的要求处理文本，保持编号信息完整。"
                     }, {
                         role: "user",
                         content: `请严格按照以下规则处理文本：
@@ -294,10 +400,10 @@
 2. 同一说话者的连续短句合并为一段，用标点连接
 3. 语义场景转换时用空行分隔
 4. 保留原始文本内容，不添加额外说明
-5. 去除时间戳和序号，只保留对话内容
+5. 每个完整句子前标注组成编号，格式：[编号1,编号2,编号3] 合并后的文本
 
 处理文本：
-${text}`
+${numberedText}`
                     }],
                     temperature: 0.1,
                     max_tokens: 4000
@@ -319,13 +425,21 @@ ${text}`
             if (completedFiles.size === 0) return;
 
             const zip = new JSZip();
-            const folder = zip.folder("processed_files");
+            const processedFolder = zip.folder("processed_files");
+            const numberingFolder = zip.folder("numbering_info");
             let addedFiles = 0;
 
+            // 添加处理后的文本文件
             completedFiles.forEach((content, filename) => {
                 const newName = filename.replace(/\.srt$/i, '') + '.txt';
-                folder.file(newName, content);
+                processedFolder.file(newName, content);
                 addedFiles++;
+            });
+
+            // 添加编号信息文件
+            numberingFiles.forEach((numberingInfo, filename) => {
+                const numberingName = filename.replace(/\.srt$/i, '') + '_numbering.txt';
+                numberingFolder.file(numberingName, numberingInfo);
             });
 
             try {
@@ -453,6 +567,7 @@ ${text}`
         function resetUI() {
             processingQueue.clear();
             completedFiles.clear();
+            numberingFiles.clear();
             document.getElementById('fileList').innerHTML = '';
             document.getElementById('globalProgressFill').style.width = '0%';
             document.getElementById('downloadAll').style.display = 'none';
