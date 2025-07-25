@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>SRT批量处理工具 - OpenAI版本</title>
+    <title>文本批量处理工具 - OpenAI版本（支持SRT/TXT）</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
         body {
@@ -109,10 +109,25 @@
             border: 1px solid #ddd;
             border-radius: 4px;
         }
+        .file-type-indicator {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.8em;
+            margin-right: 5px;
+        }
+        .file-type-srt {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+        .file-type-txt {
+            background: #f3e5f5;
+            color: #7b1fa2;
+        }
     </style>
 </head>
 <body>
-    <h1>SRT批量处理工具 - OpenAI版本</h1>
+    <h1>文本批量处理工具 - OpenAI版本（支持SRT/TXT）</h1>
     
     <div class="config-section">
         <h3>配置设置</h3>
@@ -137,8 +152,9 @@
     </div>
     
     <div class="upload-box" onclick="document.getElementById('fileInput').click()">
-        <input type="file" id="fileInput" accept=".srt" multiple hidden>
-        <p>点击选择或拖放多个SRT文件</p>
+        <input type="file" id="fileInput" accept=".srt,.txt" multiple hidden>
+        <p>点击选择或拖放多个SRT/TXT文件</p>
+        <p style="font-size: 0.9em; color: #666;">支持.srt（字幕文件）和.txt（纯文本文件）格式</p>
     </div>
 
     <div class="file-list" id="fileList"></div>
@@ -234,18 +250,18 @@
 
                     updateFileStatus(file.name, 'processing');
                     
-                    // 读取和解析SRT内容
+                    // 读取和解析文件内容
                     const content = await readFile(file);
-                    const srtEntries = parseSRTWithNumbers(content);
+                    const entries = parseFileContent(content, file.name);
                     
                     // API请求间隔控制
                     await new Promise(resolve => setTimeout(resolve, indexInBatch * REQUEST_INTERVAL));
                     
                     // API调用
-                    const processed = await callOpenAI(srtEntries, abortController.signal);
+                    const processed = await callOpenAI(entries, file.name, abortController.signal);
                     
                     // 处理结果和生成编号文件
-                    const { cleanText, numberingInfo } = processResult(processed, srtEntries);
+                    const { cleanText, numberingInfo } = processResult(processed, entries);
                     
                     // 保存结果
                     completedFiles.set(file.name, cleanText);
@@ -270,7 +286,19 @@
             });
         }
 
-        function parseSRTWithNumbers(content) {
+        function parseFileContent(content, filename) {
+            const fileExtension = filename.toLowerCase().split('.').pop();
+            
+            if (fileExtension === 'srt') {
+                return parseSRTContent(content);
+            } else if (fileExtension === 'txt') {
+                return parseTXTContent(content);
+            } else {
+                throw new Error('不支持的文件格式');
+            }
+        }
+
+        function parseSRTContent(content) {
             // 解析SRT格式，返回带编号的条目
             const entries = [];
             const blocks = content.split(/\n\s*\n/);
@@ -286,9 +314,40 @@
                         entries.push({
                             number: parseInt(number),
                             timestamp: timestamp,
-                            text: text
+                            text: text,
+                            type: 'srt'
                         });
                     }
+                }
+            });
+            
+            return entries;
+        }
+
+        function parseTXTContent(content) {
+            // 解析TXT格式，按行或段落分割
+            const entries = [];
+            let lines = content.split('\n');
+            
+            // 清理空行
+            lines = lines.map(line => line.trim()).filter(line => line.length > 0);
+            
+            // 如果内容很少，尝试按句号分割
+            if (lines.length <= 3) {
+                const sentences = content.split(/[。！？.!?]+/).map(s => s.trim()).filter(s => s.length > 0);
+                if (sentences.length > lines.length) {
+                    lines = sentences;
+                }
+            }
+            
+            lines.forEach((line, index) => {
+                if (line.trim()) {
+                    entries.push({
+                        number: index + 1,
+                        timestamp: null,
+                        text: line.trim(),
+                        type: 'txt'
+                    });
                 }
             });
             
@@ -351,13 +410,19 @@
             };
         }
 
-        async function callOpenAI(srtEntries, signal) {
+        async function callOpenAI(entries, filename, signal) {
             const apiKey = document.getElementById('apiKey').value.trim();
             const model = document.getElementById('modelSelect').value;
             const baseUrl = document.getElementById('baseUrl').value.trim() || 'https://api.openai.com/v1';
             
             // 构建带编号的文本
-            const numberedText = srtEntries.map(entry => `[${entry.number}] ${entry.text}`).join('\n');
+            const numberedText = entries.map(entry => `[${entry.number}] ${entry.text}`).join('\n');
+            
+            // 根据文件类型调整提示词
+            const fileType = entries.length > 0 ? entries[0].type : 'txt';
+            const promptSuffix = fileType === 'srt' ? 
+                '这是一个字幕文件(SRT格式)，请按对话逻辑重新组织。' : 
+                '这是一个纯文本文件，请按语义逻辑重新组织段落。';
             
             const response = await fetch(`${baseUrl}/chat/completions`, {
                 method: 'POST',
@@ -373,11 +438,13 @@
                     }, {
                         role: "user",
                         content: `请严格按照以下规则处理文本：
-1. 按对话轮换划分段落，不同说话者独立成段
-2. 同一说话者的连续短句合并为一段，用标点连接
+1. 按对话轮换或语义逻辑划分段落，不同说话者或主题独立成段
+2. 同一说话者的连续短句或相关内容合并为一段，用标点连接
 3. 语义场景转换时用空行分隔
 4. 保留原始文本内容，不添加额外说明
 5. 每个完整句子前标注组成编号，格式：[编号1,编号2,编号3] 合并后的文本
+
+${promptSuffix}
 
 处理文本：
 ${numberedText}`
@@ -408,14 +475,14 @@ ${numberedText}`
 
             // 添加处理后的文本文件
             completedFiles.forEach((content, filename) => {
-                const newName = filename.replace(/\.srt$/i, '') + '.txt';
+                const newName = filename.replace(/\.(srt|txt)$/i, '') + '.txt';
                 processedFolder.file(newName, content);
                 addedFiles++;
             });
 
             // 添加编号信息文件
             numberingFiles.forEach((numberingInfo, filename) => {
-                const numberingName = filename.replace(/\.srt$/i, '') + '_numbering.txt';
+                const numberingName = filename.replace(/\.(srt|txt)$/i, '') + '_numbering.txt';
                 numberingFolder.file(numberingName, numberingInfo);
             });
 
@@ -443,7 +510,7 @@ ${numberedText}`
             const url = URL.createObjectURL(content);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `srt_results_${Date.now()}.zip`;
+            a.download = `text_results_${Date.now()}.zip`;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
@@ -475,10 +542,21 @@ ${numberedText}`
             finalizeProcessing();
         }
 
+        function getFileTypeClass(filename) {
+            const extension = filename.toLowerCase().split('.').pop();
+            return extension === 'srt' ? 'file-type-srt' : 'file-type-txt';
+        }
+
         function initializeFileList(files) {
-            const listHTML = files.map(file => `
+            const listHTML = files.map(file => {
+                const extension = file.name.toLowerCase().split('.').pop().toUpperCase();
+                const typeClass = getFileTypeClass(file.name);
+                return `
                 <div class="file-item" id="file-${file.name}">
-                    <span style="flex: 0 0 200px">${file.name}</span>
+                    <span style="flex: 0 0 200px">
+                        <span class="file-type-indicator ${typeClass}">${extension}</span>
+                        ${file.name}
+                    </span>
                     <div class="progress-container">
                         <div class="progress-bar">
                             <div class="progress-fill"></div>
@@ -486,7 +564,7 @@ ${numberedText}`
                     </div>
                     <span class="status" style="width: 150px; text-align: right"></span>
                 </div>
-            `).join('');
+            `;}).join('');
             document.getElementById('fileList').innerHTML = listHTML;
         }
 
@@ -558,7 +636,7 @@ ${numberedText}`
             if (isProcessing) return;
             
             const files = Array.from(e.dataTransfer.files)
-                .filter(f => f.name.endsWith('.srt'));
+                .filter(f => f.name.endsWith('.srt') || f.name.endsWith('.txt'));
             
             if (files.length > 0) {
                 document.getElementById('fileInput').files = e.dataTransfer.files;
@@ -566,7 +644,7 @@ ${numberedText}`
             }
         });
 
-        // ============== 本地存储配置 ==============
+        // ============== 配置保存/恢复 ==============
         // 页面加载时恢复配置
         window.addEventListener('load', () => {
             const savedApiKey = localStorage.getItem('openai_api_key');
